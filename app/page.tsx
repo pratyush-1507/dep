@@ -1,6 +1,11 @@
+"use client";
+
 import Link from "next/link";
+import { useAuth } from "@/components/AuthProvider";
 
 export default function HomePage() {
+  const { user, loading } = useAuth();
+
   return (
     <>
       {/* Hero */}
@@ -12,12 +17,25 @@ export default function HomePage() {
           based on your conditions, allergies, and dietary preferences.
         </p>
         <div className="hero-actions">
-          <Link href="/signup" className="hero-btn hero-btn-primary">
-            Get Started Free
-          </Link>
-          <Link href="/login" className="hero-btn hero-btn-outline">
-            Sign In
-          </Link>
+          {!loading && user ? (
+            <>
+              <Link href="/scan" className="hero-btn hero-btn-primary">
+                Start Scanning
+              </Link>
+              <Link href="/dashboard" className="hero-btn hero-btn-outline">
+                Go to Dashboard
+              </Link>
+            </>
+          ) : !loading ? (
+            <>
+              <Link href="/signup" className="hero-btn hero-btn-primary">
+                Get Started
+              </Link>
+              <Link href="/login" className="hero-btn hero-btn-outline">
+                Sign In
+              </Link>
+            </>
+          ) : null}
         </div>
       </section>
 

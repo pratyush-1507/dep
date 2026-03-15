@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useAuth } from "./AuthProvider";
 import { useState } from "react";
+import ThemeToggle from "./ThemeToggle";
 
 export default function Navbar() {
   const { user, loading, signOut } = useAuth();
@@ -16,13 +17,16 @@ export default function Navbar() {
           <span className="brand-text">HealthScan</span>
         </Link>
 
-        <button
-          className="mobile-toggle"
-          onClick={() => setMobileOpen(!mobileOpen)}
-          aria-label="Toggle menu"
-        >
-          <span className={`hamburger ${mobileOpen ? "open" : ""}`} />
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+          <ThemeToggle />
+          <button
+            className="mobile-toggle"
+            onClick={() => setMobileOpen(!mobileOpen)}
+            aria-label="Toggle menu"
+          >
+            <span className={`hamburger ${mobileOpen ? "open" : ""}`} />
+          </button>
+        </div>
 
         <div className={`navbar-links ${mobileOpen ? "show" : ""}`}>
           {!loading && user ? (

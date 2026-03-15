@@ -1,7 +1,6 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { User } from "@supabase/supabase-js";
 
 interface AuthContextType {
@@ -23,21 +22,39 @@ export function useAuth() {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const supabase = createClient();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const supabaseRef = useRef<any>(null);
 
   useEffect(() => {
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      setLoading(false);
-    });
+    // Dynamic import ensures this code NEVER runs during SSR / build-time prerendering
+    import("@/lib/supabase/client").then(({ createClient }) => {
+      const supabase = createClient();
+      if (!supabase) {
+        // Env vars missing (e.g. build environment) — treat as unauthenticated
+        setLoading(false);
+        return;
+      }
+      supabaseRef.current = supabase;
 
-    return () => subscription.unsubscribe();
-  }, [supabase.auth]);
+      const {
+        data: { subscription },
+      } = supabase.auth.onAuthStateChange(
+        (_event: unknown, session: { user: User } | null) => {
+          setUser(session?.user ?? null);
+          setLoading(false);
+        }
+      );
+
+      // Cleanup on unmount
+      return () => subscription.unsubscribe();
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    if (supabaseRef.current) {
+      await supabaseRef.current.auth.signOut();
+    }
     window.location.href = "/login";
   };
 

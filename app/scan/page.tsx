@@ -1,9 +1,8 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useRouter } from "next/navigation";
-import { useEffect } from "react";
 
 interface VerdictResult {
   product_name: string;
@@ -12,6 +11,14 @@ interface VerdictResult {
   reasoning: string;
   triggered_rules: string[];
   data_source: string;
+}
+
+interface OFFData {
+  allergensTags: string[];
+  ingredients: string[];
+  ingredientsText: string;
+  imageUrl: string | null;
+  brand: string;
 }
 
 interface ChatMessage {
@@ -25,8 +32,36 @@ export default function ScanPage() {
   const [barcode, setBarcode] = useState("");
   const [scanning, setScanning] = useState(false);
   const [verdict, setVerdict] = useState<VerdictResult | null>(null);
+  const [offData, setOffData] = useState<OFFData | null>(null);
   const [error, setError] = useState("");
   const [tab, setTab] = useState<"barcode" | "ocr">("barcode");
+
+  // Camera scanning state
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const [scannedValue, setScannedValue] = useState("");
+  const [scannerReady, setScannerReady] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Attach stream to video element whenever stream or cameraActive changes
+  useEffect(() => {
+    if (mediaStream && videoRef.current) {
+      videoRef.current.srcObject = mediaStream;
+      videoRef.current.play().catch(console.error);
+      // Give the video a moment to start then begin barcode detection
+      const t = setTimeout(() => {
+        setScannerReady(true);
+        startBarcodeDetection();
+      }, 800);
+      return () => clearTimeout(t);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaStream, cameraActive]);
+
 
   // OCR state
   const [ocrBarcode, setOcrBarcode] = useState("");
@@ -55,30 +90,166 @@ export default function ScanPage() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages]);
 
-  const handleScan = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!barcode.trim()) return;
+  // Stop camera when leaving barcode tab
+  useEffect(() => {
+    if (tab !== "barcode") {
+      stopCamera();
+    }
+  }, [tab]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopCamera();
+    };
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    if (scanIntervalRef.current) {
+      clearInterval(scanIntervalRef.current);
+      scanIntervalRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    setMediaStream(null);
+    setCameraActive(false);
+    setScannerReady(false);
+  }, []);
+
+  const startCamera = useCallback(async () => {
+    setCameraError("");
+    setScannedValue("");
+    setError("");
+    setVerdict(null);
+    setScannerReady(false);
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      streamRef.current = stream;
+      // Set cameraActive FIRST so the <video> element renders,
+      // then setMediaStream triggers the useEffect to attach srcObject
+      setCameraActive(true);
+      setMediaStream(stream);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("Permission") || msg.includes("NotAllowed")) {
+        setCameraError("Camera permission denied. Please allow camera access and try again.");
+      } else if (msg.includes("NotFound") || msg.includes("DevicesNotFound")) {
+        setCameraError("No camera found. Please connect a camera and try again.");
+      } else {
+        setCameraError("Could not start camera: " + msg);
+      }
+    }
+  }, []);
+
+  const startBarcodeDetection = useCallback(() => {
+    // Use BarcodeDetector API if available (Chrome/Edge)
+    if (typeof window !== "undefined" && "BarcodeDetector" in window) {
+      // @ts-expect-error BarcodeDetector is not in TS lib yet
+      const detector = new window.BarcodeDetector({
+        formats: [
+          "ean_13", "ean_8", "upc_a", "upc_e",
+          "code_128", "code_39", "code_93",
+          "qr_code", "data_matrix",
+        ],
+      });
+
+      scanIntervalRef.current = setInterval(async () => {
+        if (!videoRef.current || videoRef.current.readyState < 2) return;
+        try {
+          const barcodes = await detector.detect(videoRef.current);
+          if (barcodes.length > 0) {
+            const code = barcodes[0].rawValue;
+            setScannedValue(code);
+            setBarcode(code);
+            stopCamera();
+            handleScanBarcode(code);
+          }
+        } catch {
+          // continue scanning
+        }
+      }, 300);
+    } else {
+      // Fallback: use canvas + ZXing
+      startZXingScanner();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopCamera]);
+
+  const startZXingScanner = useCallback(async () => {
+    try {
+      const { BrowserMultiFormatReader } = await import("@zxing/browser");
+      const codeReader = new BrowserMultiFormatReader();
+
+      scanIntervalRef.current = setInterval(async () => {
+        if (!videoRef.current || !canvasRef.current) return;
+        if (videoRef.current.readyState < 2) return;
+
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        canvas.width = videoRef.current.videoWidth;
+        canvas.height = videoRef.current.videoHeight;
+        ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+
+        try {
+          const result = await codeReader.decodeFromCanvas(canvas);
+          if (result) {
+            const code = result.getText();
+            setScannedValue(code);
+            setBarcode(code);
+            stopCamera();
+            handleScanBarcode(code);
+          }
+        } catch {
+          // No barcode found yet, continue scanning
+        }
+      }, 300);
+    } catch (err) {
+      console.error("ZXing failed to load", err);
+      setCameraError("Barcode scanner failed to load. Please enter the barcode manually.");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopCamera]);
+
+  const handleScanBarcode = async (code: string) => {
+    if (!code.trim()) return;
     setScanning(true);
     setError("");
     setVerdict(null);
+    setOffData(null);
 
     try {
-      // Look up product
-      const prodRes = await fetch(`/api/products?barcode=${encodeURIComponent(barcode)}`);
+      const prodRes = await fetch(`/api/products?barcode=${encodeURIComponent(code)}`);
       const prodData = await prodRes.json();
 
       if (!prodData.found) {
-        setError("Product not found. Try adding it via OCR upload.");
+        // Product not in DB or OFF — switch to OCR tab with barcode pre-filled
+        setOcrBarcode(code);
+        setTab("ocr");
         setScanning(false);
         return;
       }
 
-      // Get verdict
-      const verdictBody: { product_id?: string; candidate_id?: string } = {};
-      if (prodData.source === "products") {
-        verdictBody.product_id = prodData.product.id;
+      // Store enriched OFF data if present
+      if (prodData.offData) {
+        setOffData(prodData.offData);
+      }
+
+      // Build verdict request body
+      let verdictBody: Record<string, unknown> = {};
+      if (prodData.source === "products" && prodData.product.id) {
+        verdictBody = { product_id: prodData.product.id };
+      } else if (prodData.source === "candidate") {
+        verdictBody = { candidate_id: prodData.product.id };
       } else {
-        verdictBody.candidate_id = prodData.product.id;
+        // openfoodfacts — pass the product inline (it may have been cached with an id)
+        verdictBody = { inline_product: prodData.product };
       }
 
       const verdictRes = await fetch("/api/verdict", {
@@ -99,6 +270,12 @@ export default function ScanPage() {
     }
 
     setScanning(false);
+  };
+
+  const handleManualScan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!barcode.trim()) return;
+    await handleScanBarcode(barcode);
   };
 
   const handleOcrSubmit = async (e: React.FormEvent) => {
@@ -211,8 +388,72 @@ export default function ScanPage() {
 
       {tab === "barcode" ? (
         <div className="glass-card">
-          <h2 className="section-title">Enter Barcode</h2>
-          <form onSubmit={handleScan} className="scan-form">
+          <h2 className="section-title">Scan Barcode</h2>
+
+          {/* Camera Scanner Area */}
+          <div className="camera-wrapper">
+            {!cameraActive ? (
+              <div className="camera-placeholder">
+                <div className="camera-placeholder-icon">📷</div>
+                <p className="camera-placeholder-text">Point your camera at a product barcode</p>
+                <button
+                  className="btn btn-primary btn-large"
+                  onClick={startCamera}
+                  disabled={scanning}
+                >
+                  {scanning ? "Processing..." : "Start Camera Scanner"}
+                </button>
+              </div>
+            ) : (
+              <div className="camera-live">
+                <video
+                  ref={videoRef}
+                  className="camera-video"
+                  autoPlay
+                  playsInline
+                  muted
+                />
+                {/* Hidden canvas for ZXing fallback */}
+                <canvas ref={canvasRef} style={{ display: "none" }} />
+                {/* Scanner overlay */}
+                <div className="scanner-overlay">
+                  <div className="scanner-frame">
+                    <div className="scanner-corner scanner-corner-tl" />
+                    <div className="scanner-corner scanner-corner-tr" />
+                    <div className="scanner-corner scanner-corner-bl" />
+                    <div className="scanner-corner scanner-corner-br" />
+                    {scannerReady && <div className="scanner-line" />}
+                  </div>
+                  <p className="scanner-hint">
+                    {scannerReady ? "Align barcode within the frame" : "Initializing scanner..."}
+                  </p>
+                </div>
+                <button className="btn btn-outline camera-stop-btn" onClick={stopCamera}>
+                  ✕ Stop Camera
+                </button>
+              </div>
+            )}
+
+            {cameraError && (
+              <div className="auth-error" style={{ marginTop: "1rem" }}>
+                {cameraError}
+              </div>
+            )}
+
+            {scannedValue && (
+              <div className="scan-success-banner">
+                ✅ Barcode detected: <strong>{scannedValue}</strong>
+              </div>
+            )}
+          </div>
+
+          {/* Divider */}
+          <div className="scan-divider">
+            <span>or enter manually</span>
+          </div>
+
+          {/* Manual Entry */}
+          <form onSubmit={handleManualScan} className="scan-form">
             <div className="scan-input-row">
               <input
                 type="text"
@@ -228,13 +469,31 @@ export default function ScanPage() {
           </form>
 
           {error && <div className="auth-error">{error}</div>}
+          {scanning && (
+            <div className="scan-processing">
+              <div className="scan-spinner" />
+              Looking up product...
+            </div>
+          )}
 
           {verdict && (
             <div className={`verdict-card verdict-card-${verdict.verdict}`}>
+              {/* Header row: optional image + name + verdict */}
               <div className="verdict-header">
+                {offData?.imageUrl && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={offData.imageUrl}
+                    alt={verdict.product_name}
+                    className="verdict-product-img"
+                  />
+                )}
                 <span className="verdict-icon-large">{verdictIcon(verdict.verdict)}</span>
-                <div>
+                <div style={{ flex: 1, minWidth: 0 }}>
                   <h3 className="verdict-product">{verdict.product_name}</h3>
+                  {offData?.brand && (
+                    <p className="verdict-brand">{offData.brand}</p>
+                  )}
                   <div className={`verdict-badge verdict-${verdict.verdict}`}>
                     {verdict.verdict.toUpperCase()}
                   </div>
@@ -244,8 +503,22 @@ export default function ScanPage() {
               <div className="verdict-details">
                 <div className="verdict-meta">
                   <span>Confidence: {Math.round(verdict.confidence * 100)}%</span>
-                  <span>Source: {verdict.data_source}</span>
+                  <span>Source: {verdict.data_source === "openfoodfacts" ? "Open Food Facts" : verdict.data_source}</span>
                 </div>
+
+                {/* Allergens Panel */}
+                {offData?.allergensTags && offData.allergensTags.length > 0 && (
+                  <div className="verdict-allergens">
+                    <h4>⚠️ Allergens Declared</h4>
+                    <div className="tag-list">
+                      {offData.allergensTags.map((a, i) => (
+                        <span key={i} className="tag tag-allergen">
+                          {a}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {verdict.reasoning && (
                   <div className="verdict-reasoning">
@@ -266,6 +539,36 @@ export default function ScanPage() {
                     </div>
                   </div>
                 )}
+
+                {/* Ingredients Panel */}
+                {offData?.ingredients && offData.ingredients.length > 0 && (
+                  <div className="verdict-ingredients">
+                    <h4>🧾 Ingredients ({offData.ingredients.length})</h4>
+                    <div className="ingredients-chips">
+                      {offData.ingredients.map((ing, i) => {
+                        const ingLower = ing.toLowerCase();
+                        const isAllergen = offData.allergensTags.some((a) =>
+                          ingLower.includes(a.toLowerCase())
+                        );
+                        return (
+                          <span
+                            key={i}
+                            className={`ingredient-chip ${isAllergen ? "ingredient-chip-allergen" : ""}`}
+                            title={isAllergen ? "⚠️ Allergen" : undefined}
+                          >
+                            {isAllergen && <span className="ingredient-allergen-dot" />}
+                            {ing}
+                          </span>
+                        );
+                      })}
+                    </div>
+                    {offData.allergensTags.length > 0 && (
+                      <p className="ingredient-legend">
+                        <span className="ingredient-allergen-dot" /> = Allergen detected
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
 
               <button
@@ -283,6 +586,12 @@ export default function ScanPage() {
       ) : (
         <div className="glass-card">
           <h2 className="section-title">Manual Product Entry</h2>
+          {ocrBarcode && (
+            <div className="ocr-redirect-notice">
+              🔍 Product with barcode <strong>{ocrBarcode}</strong> was not found in our database.
+              Please fill in the details below to help us add it!
+            </div>
+          )}
           <p className="section-desc">
             Enter product details manually. Community scans help improve our database.
           </p>
