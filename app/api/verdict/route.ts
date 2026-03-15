@@ -3,19 +3,25 @@ import { requireAuth } from "@/lib/supabase/proxy";
 import { evaluateHealthRules, type ProductData, type UserProfile, type HealthRule } from "@/lib/health-rules";
 
 // POST /api/verdict — evaluate product for user
+// Accepts: { product_id } | { candidate_id } | { inline_product: ProductData & { name, barcode } }
 export async function POST(request: Request) {
   try {
     const { user, supabase } = await requireAuth();
     const body = await request.json();
-    const { product_id, candidate_id } = body;
+    const { product_id, candidate_id, inline_product } = body;
 
-    if (!product_id && !candidate_id) {
-      return NextResponse.json({ error: "product_id or candidate_id required" }, { status: 400 });
+    if (!product_id && !candidate_id && !inline_product) {
+      return NextResponse.json(
+        { error: "product_id, candidate_id, or inline_product required" },
+        { status: 400 }
+      );
     }
 
     // Fetch product data
     let productData: ProductData | null = null;
-    let dataSource: "barcode" | "ocr" = "barcode";
+    let dataSource: "barcode" | "ocr" | "openfoodfacts" = "barcode";
+    let savedProductId: string | null = product_id || null;
+    let savedCandidateId: string | null = candidate_id || null;
 
     if (product_id) {
       const { data } = await supabase
@@ -65,13 +71,34 @@ export async function POST(request: Request) {
         };
         dataSource = "ocr";
       }
+    } else if (inline_product) {
+      // Product came directly from Open Food Facts (already cached in DB by /api/products)
+      productData = {
+        name: inline_product.name || "Unknown Product",
+        ingredients: inline_product.ingredients || [],
+        calories: inline_product.calories ?? null,
+        total_fat: inline_product.total_fat ?? null,
+        saturated_fat: inline_product.saturated_fat ?? null,
+        trans_fat: inline_product.trans_fat ?? null,
+        cholesterol: inline_product.cholesterol ?? null,
+        sodium: inline_product.sodium ?? null,
+        total_carbs: inline_product.total_carbs ?? null,
+        dietary_fiber: inline_product.dietary_fiber ?? null,
+        sugars: inline_product.sugars ?? null,
+        protein: inline_product.protein ?? null,
+      };
+      dataSource = "openfoodfacts";
+      // If the product was cached with an id, use it
+      if (inline_product.id) {
+        savedProductId = inline_product.id;
+      }
     }
 
     if (!productData) {
       return NextResponse.json({ error: "Product not found" }, { status: 404 });
     }
 
-    // Fetch user profile
+    // Fetch user profile & rules in parallel
     const { data: profile } = await supabase
       .from("profiles")
       .select("bmi_category")
@@ -114,13 +141,13 @@ export async function POST(request: Request) {
     // Store scan history
     await supabase.from("scan_history").insert({
       user_id: user.id,
-      product_id: product_id || null,
-      candidate_id: candidate_id || null,
+      product_id: savedProductId || null,
+      candidate_id: savedCandidateId || null,
       verdict: result.verdict,
       confidence: result.confidence,
       reasoning: result.reasoning,
       triggered_rules: result.triggered_rules,
-      data_source: dataSource,
+      data_source: dataSource === "openfoodfacts" ? "barcode" : dataSource,
     });
 
     return NextResponse.json({
