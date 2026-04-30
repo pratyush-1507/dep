@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useRouter } from "next/navigation";
+import CameraCapture from "@/components/CameraCapture";
 
 interface VerdictResult {
   product_name: string;
@@ -16,9 +17,9 @@ interface VerdictResult {
 interface OFFData {
   allergensTags: string[];
   ingredients: string[];
-  ingredientsText: string;
+  ingredientsText: string | null;
   imageUrl: string | null;
-  brand: string;
+  brand: string | null;
 }
 
 interface ChatMessage {
@@ -75,6 +76,7 @@ export default function ScanPage() {
   const [ocrMessage, setOcrMessage] = useState("");
   const [submittingOcr, setSubmittingOcr] = useState(false);
   const [extractingOcr, setExtractingOcr] = useState(false);
+  const [showOcrCamera, setShowOcrCamera] = useState(false);
 
   // Chat state
   const [chatOpen, setChatOpen] = useState(false);
@@ -433,6 +435,7 @@ export default function ScanPage() {
         setOffData({
           brand: null,
           ingredients: ingredientsList,
+          ingredientsText: null,
           allergensTags: [],
           imageUrl: null,
         });
@@ -751,20 +754,36 @@ export default function ScanPage() {
             Enter product details manually, or upload a photo of the ingredients and nutrition facts to autofill.
           </p>
 
-          <div className="ocr-upload-section">
-            <label className="btn btn-outline btn-full" style={{ display: "block", textAlign: "center", cursor: "pointer" }}>
-              {extractingOcr ? "Extracting..." : "📸 Upload Photo of Label to Autofill"}
+          <div className="ocr-upload-section" style={{ display: "flex", gap: "1rem", marginBottom: "1.5rem" }}>
+            <button type="button" className="btn btn-outline btn-full" style={{ flex: 1 }} onClick={() => setShowOcrCamera(true)} disabled={extractingOcr}>
+              📸 Take Photo
+            </button>
+            <label className="btn btn-outline btn-full" style={{ flex: 1, display: "block", textAlign: "center", cursor: "pointer" }}>
+              {extractingOcr ? "Extracting..." : "📂 Upload File"}
               <input 
                 type="file" 
                 accept="image/*" 
-                capture="environment"
                 onChange={handleOcrImageUpload} 
                 style={{ display: "none" }} 
                 disabled={extractingOcr}
               />
             </label>
-            {ocrMessage && <div className={`ocr-message ${ocrMessage.includes("Error") ? "auth-error" : "scan-success-banner"}`} style={{ marginTop: "10px" }}>{ocrMessage}</div>}
           </div>
+
+          {showOcrCamera && (
+            <div className="modal-overlay" style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.8)", zIndex: 2000, display: "flex", justifyContent: "center", alignItems: "center", padding: "1rem" }}>
+              <CameraCapture 
+                onCapture={(file) => {
+                  setShowOcrCamera(false);
+                  const fakeEvent = { target: { files: [file] } } as unknown as React.ChangeEvent<HTMLInputElement>;
+                  handleOcrImageUpload(fakeEvent);
+                }} 
+                onCancel={() => setShowOcrCamera(false)} 
+              />
+            </div>
+          )}
+
+          {ocrMessage && <div className={`ocr-message ${ocrMessage.includes("Error") || ocrMessage.includes("Failed") ? "auth-error" : "scan-success-banner"}`} style={{ marginTop: "10px", marginBottom: "1rem" }}>{ocrMessage}</div>}
 
           <form onSubmit={handleOcrSubmit}>
             <div className="form-grid">

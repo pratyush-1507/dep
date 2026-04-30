@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useRouter } from "next/navigation";
+import CameraCapture from "@/components/CameraCapture";
 
 const CONDITION_OPTIONS = [
   "Diabetes",
@@ -92,6 +93,7 @@ export default function ProfilePage() {
 
   const [bloodReportUploading, setBloodReportUploading] = useState(false);
   const [bloodReportResults, setBloodReportResults] = useState<any>(null);
+  const [showCamera, setShowCamera] = useState(false);
 
   const compressImage = (file: File): Promise<{ base64: string; mimeType: string }> => {
     return new Promise((resolve, reject) => {
@@ -336,9 +338,12 @@ export default function ProfilePage() {
           <h1>Health Profile</h1>
           <p className="page-subtitle">Manage your personal health information</p>
         </div>
-        <div style={{ position: "relative" }}>
+        <div style={{ position: "relative", display: "flex", gap: "0.5rem" }}>
+          <button type="button" className="btn btn-outline" onClick={() => setShowCamera(true)} disabled={bloodReportUploading}>
+            📸 Take Photo
+          </button>
           <label htmlFor="blood-report-upload" className="btn btn-primary" style={{ cursor: "pointer" }}>
-            {bloodReportUploading ? "⏳ Analyzing..." : "📄 Upload Blood Report (OCR)"}
+            {bloodReportUploading ? "⏳ Analyzing..." : "📄 Upload File"}
           </label>
           <input
             id="blood-report-upload"
@@ -350,6 +355,19 @@ export default function ProfilePage() {
           />
         </div>
       </div>
+
+      {showCamera && (
+        <div className="modal-overlay" style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.8)", zIndex: 2000, display: "flex", justifyContent: "center", alignItems: "center", padding: "1rem" }}>
+          <CameraCapture 
+            onCapture={(file) => {
+              setShowCamera(false);
+              const fakeEvent = { target: { files: [file] } } as unknown as React.ChangeEvent<HTMLInputElement>;
+              handleBloodReportUpload(fakeEvent);
+            }} 
+            onCancel={() => setShowCamera(false)} 
+          />
+        </div>
+      )}
 
       {bloodReportResults && (
         <div className="modal-overlay" style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", justifyContent: "center", alignItems: "center", padding: "1rem" }}>
