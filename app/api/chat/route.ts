@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAuthUser } from "@/lib/supabase/proxy";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
 
 // POST /api/chat — AI chatbot powered by Gemini (free tier), with rule-based fallback

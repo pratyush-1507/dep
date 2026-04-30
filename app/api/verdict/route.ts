@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/supabase/proxy";
 import { evaluateHealthRules, type ProductData, type UserProfile, type HealthRule } from "@/lib/health-rules";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
 
 // POST /api/verdict — evaluate product for user

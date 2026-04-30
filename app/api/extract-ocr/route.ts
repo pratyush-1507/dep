@@ -6,7 +6,7 @@ export const config = {
   api: { bodyParser: { sizeLimit: "4mb" } },
 };
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
 
 export async function POST(request: Request) {

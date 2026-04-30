@@ -90,6 +90,100 @@ export default function ProfilePage() {
   const [bmi, setBmi] = useState<number | null>(null);
   const [bmiCategory, setBmiCategory] = useState<string | null>(null);
 
+  const [bloodReportUploading, setBloodReportUploading] = useState(false);
+  const [bloodReportResults, setBloodReportResults] = useState<any>(null);
+
+  const compressImage = (file: File): Promise<{ base64: string; mimeType: string }> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const MAX_SIZE = 1200; // max dimension for blood report (needs slightly higher res for text)
+        let w = img.width;
+        let h = img.height;
+        if (w > MAX_SIZE || h > MAX_SIZE) {
+          if (w > h) { h = Math.round(h * MAX_SIZE / w); w = MAX_SIZE; }
+          else { w = Math.round(w * MAX_SIZE / h); h = MAX_SIZE; }
+        }
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) { reject(new Error("Canvas not supported")); return; }
+        ctx.drawImage(img, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+        const base64 = dataUrl.split(",")[1];
+        resolve({ base64, mimeType: "image/jpeg" });
+      };
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = URL.createObjectURL(file);
+    });
+  };
+
+  const handleBloodReportUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setBloodReportUploading(true);
+    setMessage(null);
+
+    try {
+      const { base64, mimeType } = await compressImage(file);
+      
+      const res = await fetch("/api/extract-blood-report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64, mimeType }),
+      });
+
+      let data;
+      try { data = await res.json(); } catch { throw new Error("Invalid response from server"); }
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to analyze blood report");
+      }
+
+      setBloodReportResults(data.result);
+    } catch (err) {
+      setMessage({ type: "error", text: err instanceof Error ? err.message : "Blood report analysis failed." });
+    }
+    
+    setBloodReportUploading(false);
+  };
+
+  const applyBloodReportSuggestions = () => {
+    if (!bloodReportResults) return;
+    
+    // Merge conditions
+    if (bloodReportResults.suggested_conditions?.length > 0) {
+      const existingNames = new Set(conditions.map(c => c.condition_name));
+      const newConditions = bloodReportResults.suggested_conditions
+        .filter((c: any) => !existingNames.has(c.condition_name.toLowerCase()))
+        .map((c: any) => ({ condition_name: c.condition_name.toLowerCase().replace(/\s+/g, "_"), severity: c.severity }));
+      setConditions(prev => [...prev, ...newConditions]);
+    }
+
+    // Merge preferences
+    if (bloodReportResults.suggested_preferences?.length > 0) {
+      const existingPrefs = new Set(preferences);
+      const newPrefs = bloodReportResults.suggested_preferences
+        .map((p: string) => p.toLowerCase().replace(/\s+/g, "-"))
+        .filter((p: string) => !existingPrefs.has(p));
+      setPreferences(prev => [...prev, ...newPrefs]);
+    }
+
+    // Merge limits
+    if (bloodReportResults.suggested_limits?.length > 0) {
+      const existingNutrients = new Set(limits.map(l => l.nutrient));
+      const newLimits = bloodReportResults.suggested_limits
+        .filter((l: any) => !existingNutrients.has(l.nutrient.toLowerCase()))
+        .map((l: any) => ({ nutrient: l.nutrient.toLowerCase(), max_daily_value: l.max_daily_value, unit: l.unit }));
+      setLimits(prev => [...prev, ...newLimits]);
+    }
+
+    setBloodReportResults(null);
+    setMessage({ type: "success", text: "Suggestions applied! Click 'Save Profile' to permanently save them." });
+  };
+
   const calcBmi = useCallback(() => {
     if (profile.height_cm && profile.weight_kg) {
       const h = Number(profile.height_cm) / 100;
@@ -236,11 +330,77 @@ export default function ProfilePage() {
   }
 
   return (
-    <div className="page-container">
-      <div className="page-header">
-        <h1>Health Profile</h1>
-        <p className="page-subtitle">Manage your personal health information</p>
+    <div className="page-container position-relative">
+      <div className="page-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "1rem" }}>
+        <div>
+          <h1>Health Profile</h1>
+          <p className="page-subtitle">Manage your personal health information</p>
+        </div>
+        <div style={{ position: "relative" }}>
+          <label htmlFor="blood-report-upload" className="btn btn-primary" style={{ cursor: "pointer" }}>
+            {bloodReportUploading ? "⏳ Analyzing..." : "📄 Upload Blood Report (OCR)"}
+          </label>
+          <input
+            id="blood-report-upload"
+            type="file"
+            accept="image/*"
+            style={{ display: "none" }}
+            onChange={handleBloodReportUpload}
+            disabled={bloodReportUploading}
+          />
+        </div>
       </div>
+
+      {bloodReportResults && (
+        <div className="modal-overlay" style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", justifyContent: "center", alignItems: "center", padding: "1rem" }}>
+          <div className="glass-card" style={{ maxWidth: "600px", width: "100%", maxHeight: "90vh", overflowY: "auto", padding: "2rem" }}>
+            <h2 style={{ marginBottom: "1rem", color: "var(--primary-color)" }}>Blood Report Analysis</h2>
+            
+            <p style={{ marginBottom: "1.5rem", lineHeight: "1.5" }}>{bloodReportResults.summary}</p>
+            
+            {bloodReportResults.abnormal_biomarkers?.length > 0 && (
+              <div style={{ marginBottom: "1.5rem" }}>
+                <h3 style={{ fontSize: "1.1rem", marginBottom: "0.5rem" }}>Abnormal Biomarkers</h3>
+                <ul style={{ listStyle: "none", padding: 0 }}>
+                  {bloodReportResults.abnormal_biomarkers.map((b: any, i: number) => (
+                    <li key={i} style={{ display: "flex", justifyContent: "space-between", padding: "0.5rem", backgroundColor: "rgba(255,255,255,0.05)", borderRadius: "8px", marginBottom: "0.5rem" }}>
+                      <span>{b.name}</span>
+                      <span style={{ color: b.status === "high" ? "#ef4444" : "#3b82f6", fontWeight: "bold" }}>{b.value} ({b.status})</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div style={{ marginBottom: "1.5rem" }}>
+              <h3 style={{ fontSize: "1.1rem", marginBottom: "0.5rem" }}>Suggested Profile Updates</h3>
+              <ul style={{ paddingLeft: "1.5rem", lineHeight: "1.6" }}>
+                {bloodReportResults.suggested_conditions?.map((c: any) => (
+                  <li key={c.condition_name}>Add Condition: <strong>{c.condition_name}</strong> ({c.severity})</li>
+                ))}
+                {bloodReportResults.suggested_preferences?.map((p: string) => (
+                  <li key={p}>Add Diet Preference: <strong>{p}</strong></li>
+                ))}
+                {bloodReportResults.suggested_limits?.map((l: any) => (
+                  <li key={l.nutrient}>Add Limit: <strong>{l.nutrient}</strong> (max {l.max_daily_value}{l.unit})</li>
+                ))}
+                {(!bloodReportResults.suggested_conditions?.length && !bloodReportResults.suggested_preferences?.length && !bloodReportResults.suggested_limits?.length) && (
+                  <li>No profile updates suggested. Your report looks normal!</li>
+                )}
+              </ul>
+            </div>
+
+            <div style={{ display: "flex", gap: "1rem", marginTop: "2rem" }}>
+              <button type="button" className="btn btn-primary" style={{ flex: 1 }} onClick={applyBloodReportSuggestions}>
+                Apply Suggestions
+              </button>
+              <button type="button" className="btn" style={{ flex: 1, backgroundColor: "rgba(255,255,255,0.1)" }} onClick={() => setBloodReportResults(null)}>
+                Discard
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {message && (
         <div className={`message ${message.type === "success" ? "message-success" : "message-error"}`}>
