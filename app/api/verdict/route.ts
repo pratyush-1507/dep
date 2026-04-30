@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/supabase/proxy";
 import { evaluateHealthRules, type ProductData, type UserProfile, type HealthRule } from "@/lib/health-rules";
 
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
+
 // POST /api/verdict — evaluate product for user
 // Accepts: { product_id } | { candidate_id } | { inline_product: ProductData & { name, barcode } }
 export async function POST(request: Request) {
@@ -135,8 +138,18 @@ export async function POST(request: Request) {
       priority: r.priority,
     }));
 
-    // Evaluate
-    const result = evaluateHealthRules(productData, userProfile, healthRules);
+    // Evaluate with AI (fallback to deterministic if it fails)
+    const apiKey = process.env.GEMINI_API_KEY;
+    let result = null;
+
+    if (apiKey) {
+      result = await evaluateWithAI(productData, userProfile, healthRules, apiKey);
+    }
+
+    if (!result) {
+      console.warn("[Verdict] AI evaluation failed or missing key, falling back to deterministic rules");
+      result = evaluateHealthRules(productData, userProfile, healthRules);
+    }
 
     // Store scan history
     await supabase.from("scan_history").insert({
@@ -155,7 +168,87 @@ export async function POST(request: Request) {
       ...result,
       data_source: dataSource,
     });
-  } catch {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  } catch (err: unknown) {
+    console.error("[Verdict API Error]:", err);
+    return NextResponse.json({ error: "Unauthorized or Error occurred" }, { status: 401 });
+  }
+}
+
+// ── AI Verdict Evaluator ──────────────────────────────────────────────
+
+async function evaluateWithAI(
+  product: ProductData,
+  profile: UserProfile,
+  rules: HealthRule[],
+  apiKey: string
+) {
+  try {
+    const prompt = `
+You are HealthScan AI's verdict engine. Your job is to act as a highly strict medical and nutritional rule evaluator.
+You will be provided with a Product's Nutritional Data, the User's Health Profile, and a list of System Health Rules.
+
+YOUR INSTRUCTIONS:
+1. Compare the Product Data against the User's Health Profile (conditions, allergies, preferences).
+2. Apply standard medical/dietary common sense AND strictly enforce any of the System Health Rules provided.
+3. Determine if the product is 'safe', 'caution' (minor flags, moderation required), or 'avoid' (contains allergens or heavily violates conditions).
+4. Provide a reasoning paragraph and list any triggered rules.
+5. You MUST return your answer as a valid JSON object matching exactly this schema, and nothing else (no markdown blocks like \`\`\`json):
+{
+  "verdict": "safe" | "caution" | "avoid",
+  "confidence": number (0.0 to 1.0),
+  "reasoning": "A concise, user-friendly explanation of why this verdict was given",
+  "triggered_rules": ["List", "of", "rules", "broken", "or 'none'"]
+}
+
+--- DATA ---
+PRODUCT DATA:
+${JSON.stringify(product, null, 2)}
+
+USER PROFILE:
+${JSON.stringify(profile, null, 2)}
+
+SYSTEM RULES TO CONSIDER:
+${JSON.stringify(rules, null, 2)}
+`;
+
+    const payload = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 800,
+        temperature: 0.1, // very low temperature for deterministic evaluation
+        responseMimeType: "application/json",
+      },
+    };
+
+    const res = await fetch(`${GEMINI_URL}${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      console.error("[AI Verdict] HTTP", res.status, await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    let text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) return null;
+
+    text = text.replace(/```json\n?/gi, "").replace(/```\n?/gi, "").trim();
+
+    const parsed = JSON.parse(text);
+    if (!["safe", "caution", "avoid"].includes(parsed.verdict)) return null;
+
+    return {
+      verdict: parsed.verdict,
+      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.9,
+      reasoning: parsed.reasoning || "AI evaluated this product based on your profile.",
+      triggered_rules: Array.isArray(parsed.triggered_rules) ? parsed.triggered_rules : [],
+    };
+  } catch (err) {
+    console.error("[AI Verdict] Failed:", err);
+    return null;
   }
 }

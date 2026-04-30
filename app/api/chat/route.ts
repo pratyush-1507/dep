@@ -1,49 +1,226 @@
 import { NextResponse } from "next/server";
-import { requireAuth } from "@/lib/supabase/proxy";
+import { getAuthUser } from "@/lib/supabase/proxy";
 
-// POST /api/chat — AI chatbot stub
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
+
+// POST /api/chat — AI chatbot powered by Gemini (free tier), with rule-based fallback
 export async function POST(request: Request) {
+  // Auth check — use getAuthUser (not requireAuth) to avoid 307 redirects from API routes
+  const { user, supabase } = await getAuthUser();
+  if (!user) {
+    return NextResponse.json({ error: "Please sign in to use the AI assistant." }, { status: 401 });
+  }
+
+  // Fetch User Profile Context
+  const [profileRes, conditionsRes, allergiesRes] = await Promise.all([
+    supabase.from("profiles").select("bmi_category").eq("id", user.id).single(),
+    supabase.from("health_conditions").select("condition_name").eq("user_id", user.id),
+    supabase.from("allergies").select("allergen, severity").eq("user_id", user.id),
+  ]);
+
+  const userProfileText = [
+    `User BMI Category: ${profileRes.data?.bmi_category || "Unknown"}`,
+    `Medical Conditions: ${conditionsRes.data?.map(c => c.condition_name).join(", ") || "None"}`,
+    `Allergies: ${allergiesRes.data?.map(a => `${a.allergen} (${a.severity})`).join(", ") || "None"}`,
+  ].join("\n");
+
   try {
-    const { supabase } = await requireAuth();
     const body = await request.json();
-    const { message, product_context, verdict_context } = body;
+    const {
+      messages,        // full conversation history: { role: "user"|"assistant", content: string }[]
+      product_context, // { name, brand, ingredients, calories, sodium, sugars, total_fat, protein }
+      verdict_context, // { product_name, verdict, confidence, reasoning, triggered_rules, data_source }
+    } = body;
 
-    if (!message) {
-      return NextResponse.json({ error: "Message is required" }, { status: 400 });
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return NextResponse.json({ error: "messages array is required" }, { status: 400 });
     }
 
-    // Stub AI response — in production, integrate with OpenAI/Anthropic
-    let reply = "";
+    // Try Gemini first, fall back to deterministic if it fails
+    const apiKey = process.env.GEMINI_API_KEY;
+    const geminiReply = apiKey
+      ? await callGemini(messages, product_context, verdict_context, userProfileText, apiKey)
+      : null;
 
-    const msgLower = message.toLowerCase();
-
-    if (msgLower.includes("why") || msgLower.includes("explain")) {
-      if (verdict_context) {
-        reply = `Based on the analysis, the verdict for "${verdict_context.product_name}" is **${verdict_context.verdict}**.\n\n${verdict_context.reasoning}\n\n⚠️ This is informational only, not medical advice. Consult your healthcare provider for specific dietary guidance.`;
-      } else {
-        reply = "I'd be happy to explain a verdict — please scan a product first so I can provide context-specific information.";
+    if (geminiReply) {
+      if (geminiReply === "__RATE_LIMIT__") {
+        return NextResponse.json({
+          reply: "⏳ The AI is currently experiencing high demand and is temporarily rate-limited by Google (15 requests/minute). Please wait a few seconds and try asking again.",
+          disclaimer: "System Message",
+        });
       }
-    } else if (msgLower.includes("alternative") || msgLower.includes("suggest") || msgLower.includes("recommend")) {
-      reply = "For personalized alternatives, I'd recommend:\n\n1. Look for products with lower values in the flagged nutrients\n2. Check for allergen-free versions of similar products\n3. Consider whole food alternatives when possible\n\n⚠️ Always verify products against your personal health profile by scanning them.";
-    } else if (msgLower.includes("ingredient") || msgLower.includes("additive")) {
-      if (product_context) {
-        const ingredients = product_context.ingredients?.join(", ") || "No ingredients listed";
-        reply = `The ingredients for "${product_context.name}" are:\n\n${ingredients}\n\nWould you like me to explain any specific ingredient?`;
-      } else {
-        reply = "Please scan a product first so I can review its ingredients with you.";
-      }
-    } else {
-      reply = `I'm your HealthScan AI assistant. I can help you:\n\n• **Explain** why a product received its verdict\n• **Suggest alternatives** for flagged products\n• **Clarify ingredients** and additives\n\nTry asking: "Why was this product marked as avoid?" or "What are the ingredients?"\n\n⚠️ My responses are informational only, not medical advice.`;
+      return NextResponse.json({
+        reply: geminiReply,
+        disclaimer: "This is AI-generated informational content, not medical advice.",
+      });
     }
 
-    // Fetch from supabase just to verify connection works
-    void supabase;
-
+    // Fallback: deterministic rule-based replies
+    const reply = generateFallbackReply(messages, product_context, verdict_context);
     return NextResponse.json({
       reply,
-      disclaimer: "This is AI-generated informational content, not medical advice.",
+      disclaimer: "This is informational content, not medical advice.",
     });
-  } catch {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  } catch (err: unknown) {
+    console.error("[/api/chat] Unexpected error:", err instanceof Error ? err.message : err);
+    return NextResponse.json(
+      { error: "AI assistant encountered an error. Please try again." },
+      { status: 500 }
+    );
   }
+}
+
+// ── Gemini API (direct REST, no SDK needed) ──────────────────────────
+
+async function callGemini(
+  messages: { role: string; content: string }[],
+  product_context: Record<string, unknown> | null,
+  verdict_context: Record<string, unknown> | null,
+  userProfileText: string,
+  apiKey: string
+): Promise<string | null> {
+  try {
+    const systemInstruction = buildSystemPrompt(product_context, verdict_context, userProfileText);
+
+    // Build Gemini contents array: history + latest user message
+    const contents = messages.map((msg) => ({
+      role: msg.role === "assistant" ? "model" : "user",
+      parts: [{ text: msg.content }],
+    }));
+
+    const payload = {
+      system_instruction: { parts: [{ text: systemInstruction }] },
+      contents,
+      generationConfig: {
+        maxOutputTokens: 600,
+        temperature: 0.5,
+      },
+    };
+
+    const res = await fetch(`${GEMINI_URL}${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      console.error(`[Gemini] HTTP ${res.status}: ${errBody.substring(0, 200)}`);
+      if (res.status === 429 || res.status === 503) {
+        return "__RATE_LIMIT__";
+      }
+      return null; // fall back to deterministic for other errors
+    }
+
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return text || null;
+  } catch (err) {
+    console.error("[Gemini] Call failed:", err instanceof Error ? err.message : err);
+    return null; // fall back to deterministic
+  }
+}
+
+// ── System Prompt Builder ────────────────────────────────────────────
+
+function buildSystemPrompt(
+  product_context: Record<string, unknown> | null,
+  verdict_context: Record<string, unknown> | null,
+  userProfileText: string
+): string {
+  const parts: string[] = [
+    "You are HealthScan AI, a highly intelligent food safety assistant embedded in the HealthScan app.",
+    "Your job is to help users understand food product analysis results, explain health verdicts, suggest alternatives, and clarify ingredients or additives.",
+    "You MUST thoroughly review the USER HEALTH PROFILE below before answering. Tailor all advice and answers specifically to their health conditions, allergies, and BMI.",
+    "You MUST always include a brief disclaimer that your responses are informational only and not medical advice.",
+    "Keep responses concise, friendly, and easy to understand. Use bullet points where helpful.",
+    "Never override the deterministic health verdict. You may explain and elaborate on it, but cannot change it.",
+    "",
+    "--- USER HEALTH PROFILE ---",
+    userProfileText,
+    "---------------------------",
+  ];
+
+  if (verdict_context) {
+    const vc = verdict_context as {
+      product_name?: string; verdict?: string; confidence?: number;
+      reasoning?: string; triggered_rules?: string[]; data_source?: string;
+    };
+    parts.push(
+      `\nCURRENT PRODUCT ANALYSIS:`,
+      `Product: ${vc.product_name}`,
+      `Verdict: ${(vc.verdict ?? "unknown").toUpperCase()} (confidence: ${Math.round((vc.confidence ?? 0) * 100)}%)`,
+      `Data source: ${vc.data_source ?? "unknown"}`,
+      `Reasoning:\n${vc.reasoning ?? "N/A"}`,
+      `Triggered health rules: ${vc.triggered_rules?.join(", ") || "none"}`,
+    );
+  }
+
+  if (product_context) {
+    const pc = product_context as {
+      name?: string; brand?: string; ingredients?: string[];
+      calories?: number; sodium?: number; sugars?: number;
+      total_fat?: number; protein?: number;
+    };
+    const productDetails = [
+      `\nPRODUCT DETAILS:`,
+      `Name: ${pc.name}`,
+      pc.brand ? `Brand: ${pc.brand}` : "",
+      pc.ingredients?.length ? `Ingredients: ${pc.ingredients.join(", ")}` : "",
+      pc.calories != null ? `Calories: ${pc.calories} kcal` : "",
+      pc.sodium != null ? `Sodium: ${pc.sodium} mg` : "",
+      pc.sugars != null ? `Sugars: ${pc.sugars} g` : "",
+      pc.total_fat != null ? `Total Fat: ${pc.total_fat} g` : "",
+      pc.protein != null ? `Protein: ${pc.protein} g` : "",
+    ].filter(Boolean);
+    parts.push(...productDetails);
+  }
+
+  if (!verdict_context && !product_context) {
+    parts.push(
+      "\nNo product has been scanned yet. Encourage the user to scan a product first, but you can answer general food health questions."
+    );
+  }
+
+  return parts.join("\n");
+}
+
+// ── Deterministic Fallback ───────────────────────────────────────────
+
+function generateFallbackReply(
+  messages: { role: string; content: string }[],
+  product_context: Record<string, unknown> | null,
+  verdict_context: Record<string, unknown> | null,
+): string {
+  const lastMsg = messages[messages.length - 1]?.content || "";
+  const msgLower = lastMsg.toLowerCase();
+  const vc = verdict_context as {
+    product_name?: string; verdict?: string; reasoning?: string;
+  } | null;
+
+  if (msgLower.includes("why") || msgLower.includes("explain")) {
+    if (vc) {
+      return `Based on the analysis, the verdict for "${vc.product_name}" is **${vc.verdict?.toUpperCase()}**.\n\n${vc.reasoning}\n\n⚠️ This is informational only, not medical advice. Consult your healthcare provider for specific dietary guidance.`;
+    }
+    return "I'd be happy to explain a verdict — please scan a product first so I can provide context-specific information.";
+  }
+
+  if (msgLower.includes("alternative") || msgLower.includes("suggest") || msgLower.includes("recommend")) {
+    return "For personalized alternatives, I'd recommend:\n\n1. Look for products with lower values in the flagged nutrients\n2. Check for allergen-free versions of similar products\n3. Consider whole food alternatives when possible\n\n⚠️ Always verify products against your personal health profile by scanning them.";
+  }
+
+  if (msgLower.includes("ingredient") || msgLower.includes("additive")) {
+    const pc = product_context as { name?: string; ingredients?: string[] } | null;
+    if (pc?.ingredients?.length) {
+      return `The ingredients for "${pc.name}" are:\n\n${pc.ingredients.join(", ")}\n\nWould you like me to explain any specific ingredient?\n\n⚠️ This is informational only, not medical advice.`;
+    }
+    return "Please scan a product first so I can review its ingredients with you.";
+  }
+
+  if (vc) {
+    return `I'm your HealthScan AI assistant. The product "${vc.product_name}" was marked as **${vc.verdict?.toUpperCase()}**.\n\nYou can ask me:\n• **"Why?"** — to understand the verdict reasoning\n• **"Suggest alternatives"** — for healthier options\n• **"What are the ingredients?"** — for ingredient details\n\n⚠️ My responses are informational only, not medical advice.`;
+  }
+
+  return `I'm your HealthScan AI assistant. I can help you:\n\n• **Explain** why a product received its verdict\n• **Suggest alternatives** for flagged products\n• **Clarify ingredients** and additives\n\nTry asking: "Why was this product marked as avoid?" or "What are the ingredients?"\n\n⚠️ My responses are informational only, not medical advice.`;
 }

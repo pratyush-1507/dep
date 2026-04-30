@@ -74,6 +74,7 @@ export default function ScanPage() {
   const [ocrProtein, setOcrProtein] = useState("");
   const [ocrMessage, setOcrMessage] = useState("");
   const [submittingOcr, setSubmittingOcr] = useState(false);
+  const [extractingOcr, setExtractingOcr] = useState(false);
 
   // Chat state
   const [chatOpen, setChatOpen] = useState(false);
@@ -278,39 +279,165 @@ export default function ScanPage() {
     await handleScanBarcode(barcode);
   };
 
+  const compressImage = (file: File): Promise<{ base64: string; mimeType: string }> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const MAX_SIZE = 1024; // max dimension in pixels
+        let w = img.width;
+        let h = img.height;
+        if (w > MAX_SIZE || h > MAX_SIZE) {
+          if (w > h) { h = Math.round(h * MAX_SIZE / w); w = MAX_SIZE; }
+          else { w = Math.round(w * MAX_SIZE / h); h = MAX_SIZE; }
+        }
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) { reject(new Error("Canvas not supported")); return; }
+        ctx.drawImage(img, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+        const base64 = dataUrl.split(",")[1];
+        resolve({ base64, mimeType: "image/jpeg" });
+      };
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = URL.createObjectURL(file);
+    });
+  };
+
+  const handleOcrImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setExtractingOcr(true);
+    setOcrMessage("Compressing and extracting text from image...");
+
+    try {
+      // Compress image client-side to fit within API limits
+      const { base64, mimeType } = await compressImage(file);
+      
+      const res = await fetch("/api/extract-ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64, mimeType }),
+      });
+
+      // Handle non-JSON responses (e.g., body too large error)
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        setOcrMessage("Error: Server returned an invalid response. Image may be too large.");
+        setExtractingOcr(false);
+        return;
+      }
+
+      if (!res.ok) {
+        setOcrMessage(`Error: ${data.error || "Extraction failed"}`);
+        setExtractingOcr(false);
+        return;
+      }
+      
+      if (data.parsed_name) setOcrName(data.parsed_name);
+      if (data.parsed_ingredients?.length) setOcrIngredients(data.parsed_ingredients.join(", "));
+      if (data.parsed_nutrition) {
+        if (data.parsed_nutrition.calories != null) setOcrCalories(data.parsed_nutrition.calories.toString());
+        if (data.parsed_nutrition.sugars != null) setOcrSugars(data.parsed_nutrition.sugars.toString());
+        if (data.parsed_nutrition.sodium != null) setOcrSodium(data.parsed_nutrition.sodium.toString());
+        if (data.parsed_nutrition.total_fat != null) setOcrFat(data.parsed_nutrition.total_fat.toString());
+        if (data.parsed_nutrition.protein != null) setOcrProtein(data.parsed_nutrition.protein.toString());
+      }
+      
+      setOcrMessage("✅ Extraction successful! Review the auto-filled fields below.");
+    } catch (err) {
+      console.error("OCR upload error:", err);
+      setOcrMessage("Failed to process image. Please try a different photo.");
+    }
+    setExtractingOcr(false);
+  };
+
   const handleOcrSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!ocrBarcode.trim()) return;
     setSubmittingOcr(true);
     setOcrMessage("");
+    setError("");
+    setVerdict(null);
+
+    const ingredientsList = ocrIngredients
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const nutritionData = {
+      calories: ocrCalories ? parseFloat(ocrCalories) : null,
+      sugars: ocrSugars ? parseFloat(ocrSugars) : null,
+      sodium: ocrSodium ? parseFloat(ocrSodium) : null,
+      total_fat: ocrFat ? parseFloat(ocrFat) : null,
+      protein: ocrProtein ? parseFloat(ocrProtein) : null,
+    };
 
     try {
-      const res = await fetch("/api/ocr", {
+      // Step 1: Save to candidate_products database
+      const ocrRes = await fetch("/api/ocr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           barcode: ocrBarcode,
           parsed_name: ocrName,
-          parsed_ingredients: ocrIngredients
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean),
-          parsed_nutrition: {
-            calories: ocrCalories ? parseFloat(ocrCalories) : null,
-            sugars: ocrSugars ? parseFloat(ocrSugars) : null,
-            sodium: ocrSodium ? parseFloat(ocrSodium) : null,
-            total_fat: ocrFat ? parseFloat(ocrFat) : null,
-            protein: ocrProtein ? parseFloat(ocrProtein) : null,
-          },
+          parsed_ingredients: ingredientsList,
+          parsed_nutrition: nutritionData,
           ocr_confidence: 0.85,
         }),
       });
 
-      const data = await res.json();
-      if (data.error) {
-        setOcrMessage(`Error: ${data.error}`);
+      const ocrData = await ocrRes.json();
+      if (ocrData.error) {
+        setOcrMessage(`Error: ${ocrData.error}`);
+        setSubmittingOcr(false);
+        return;
+      }
+
+      // Step 2: Immediately get an AI verdict using the OCR data
+      setOcrMessage("Analyzing product safety...");
+
+      const inlineProduct = {
+        name: ocrName || "Unknown Product",
+        barcode: ocrBarcode,
+        ingredients: ingredientsList,
+        calories: nutritionData.calories,
+        total_fat: nutritionData.total_fat,
+        saturated_fat: null,
+        trans_fat: null,
+        cholesterol: null,
+        sodium: nutritionData.sodium,
+        total_carbs: null,
+        dietary_fiber: null,
+        sugars: nutritionData.sugars,
+        protein: nutritionData.protein,
+      };
+
+      const verdictRes = await fetch("/api/verdict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ inline_product: inlineProduct }),
+      });
+
+      const verdictData = await verdictRes.json();
+
+      if (verdictData.error) {
+        setOcrMessage(`Product saved, but verdict failed: ${verdictData.error}`);
       } else {
-        setOcrMessage(data.message || "Product data submitted!");
+        // Show the verdict card — switch to barcode tab where it renders
+        setVerdict(verdictData);
+        setOffData({
+          brand: null,
+          ingredients: ingredientsList,
+          allergensTags: [],
+          imageUrl: null,
+        });
+        setTab("barcode");
+        setOcrMessage("");
       }
     } catch {
       setOcrMessage("Failed to submit. Please try again.");
@@ -323,26 +450,57 @@ export default function ScanPage() {
     if (!chatInput.trim()) return;
     const userMsg = chatInput;
     setChatInput("");
-    setChatMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+
+    const updatedMessages: ChatMessage[] = [
+      ...chatMessages,
+      { role: "user", content: userMsg },
+    ];
+    setChatMessages(updatedMessages);
     setChatLoading(true);
+
+    // Build rich product context from offData + verdict
+    const productCtx = verdict
+      ? {
+          name: verdict.product_name,
+          brand: offData?.brand ?? null,
+          ingredients: offData?.ingredients ?? [],
+          calories: null,
+          sodium: null,
+          sugars: null,
+          total_fat: null,
+          protein: null,
+        }
+      : null;
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: userMsg,
+          messages: updatedMessages,
           verdict_context: verdict,
-          product_context: verdict ? { name: verdict.product_name, ingredients: verdict.triggered_rules } : null,
+          product_context: productCtx,
         }),
+        redirect: "error", // Don't silently follow redirects
       });
 
-      const data = await res.json();
-      setChatMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+      if (!res.ok) {
+        // Try to parse error JSON, fallback to status text
+        let errorMsg = `Server error (${res.status})`;
+        try {
+          const errData = await res.json();
+          errorMsg = errData.error || errorMsg;
+        } catch { /* not JSON */ }
+        setChatMessages((prev) => [...prev, { role: "assistant", content: errorMsg }]);
+      } else {
+        const data = await res.json();
+        const replyText = data.reply ?? "Sorry, I couldn't process your request.";
+        setChatMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+      }
     } catch {
       setChatMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Sorry, I couldn't process your request." },
+        { role: "assistant", content: "Sorry, I couldn't connect to the AI assistant. Please try again." },
       ]);
     }
 
@@ -573,10 +731,7 @@ export default function ScanPage() {
 
               <button
                 className="btn btn-outline btn-full"
-                onClick={() => {
-                  setChatOpen(true);
-                  setChatMessages([]);
-                }}
+                onClick={() => setChatOpen(true)}
               >
                 💬 Ask AI About This Product
               </button>
@@ -593,8 +748,24 @@ export default function ScanPage() {
             </div>
           )}
           <p className="section-desc">
-            Enter product details manually. Community scans help improve our database.
+            Enter product details manually, or upload a photo of the ingredients and nutrition facts to autofill.
           </p>
+
+          <div className="ocr-upload-section">
+            <label className="btn btn-outline btn-full" style={{ display: "block", textAlign: "center", cursor: "pointer" }}>
+              {extractingOcr ? "Extracting..." : "📸 Upload Photo of Label to Autofill"}
+              <input 
+                type="file" 
+                accept="image/*" 
+                capture="environment"
+                onChange={handleOcrImageUpload} 
+                style={{ display: "none" }} 
+                disabled={extractingOcr}
+              />
+            </label>
+            {ocrMessage && <div className={`ocr-message ${ocrMessage.includes("Error") ? "auth-error" : "scan-success-banner"}`} style={{ marginTop: "10px" }}>{ocrMessage}</div>}
+          </div>
+
           <form onSubmit={handleOcrSubmit}>
             <div className="form-grid">
               <div className="form-group">
@@ -648,7 +819,7 @@ export default function ScanPage() {
               </div>
             </div>
             <button type="submit" className="btn btn-primary btn-full" disabled={submittingOcr}>
-              {submittingOcr ? "Submitting..." : "Submit Product Data"}
+              {submittingOcr ? "Analyzing Product..." : "🔬 Analyze Product Safety"}
             </button>
           </form>
           {ocrMessage && (
