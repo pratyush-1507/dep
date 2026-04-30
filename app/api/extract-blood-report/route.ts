@@ -3,8 +3,8 @@ import { getAuthUser } from "@/lib/supabase/proxy";
 
 export const maxDuration = 30; // App Router API config for max duration
 
-const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
+const OPENROUTER_MODEL = "google/gemini-2.0-flash-001"; // vision-capable model
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export async function POST(request: Request) {
   try {
@@ -25,19 +25,20 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "No image provided" }, { status: 400 });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       return NextResponse.json({ error: "API key missing" }, { status: 503 });
     }
 
-    const prompt = `
-You are HealthScan AI's medical OCR agent. Your job is to extract data from a user's blood report (CBC, Lipid Panel, Metabolic Panel, etc.) and recommend updates to their HealthScan profile.
+    const systemPrompt = "You are a clinical blood report analyzer. Always respond with valid JSON only, no markdown or explanation.";
+
+    const userPrompt = `You are HealthScan AI's medical OCR agent. Your job is to extract data from a user's blood report (CBC, Lipid Panel, Metabolic Panel, etc.) and recommend updates to their HealthScan profile.
 Review the numerical results and reference ranges in the image.
 If you spot high/abnormal values (like high HbA1c, high LDL, high glucose), suggest the appropriate health conditions, dietary preferences to adopt, and daily nutrient limits to enforce.
 
-You MUST return your answer as a strictly valid JSON object matching exactly this schema, and nothing else:
+You MUST return your answer as a strictly valid JSON object (no markdown, no code blocks) matching exactly this schema:
 {
-  "summary": "A short, user-friendly 2-3 sentence summary of what the blood report shows (e.g. 'Your lipid panel shows elevated LDL cholesterol and your fasting glucose is high.')",
+  "summary": "A short, user-friendly 2-3 sentence summary of what the blood report shows",
   "suggested_conditions": [
     { "condition_name": "Diabetes" | "Hypertension" | "Heart Disease" | "Kidney Disease" | "Liver Disease" | "Thyroid Disorder" | "PCOS", "severity": "mild" | "moderate" | "severe" }
   ],
@@ -51,83 +52,37 @@ You MUST return your answer as a strictly valid JSON object matching exactly thi
     { "name": "e.g., LDL Cholesterol", "value": "e.g., 160 mg/dL", "status": "high" | "low" }
   ]
 }
-If the blood test is normal, suggest an empty array for conditions and limits, and say everything looks healthy in the summary.
-`;
+If the blood test is normal, suggest an empty array for conditions and limits, and say everything looks healthy in the summary.`;
 
     const payload = {
-      system_instruction: {
-        parts: [{ text: "You are a clinical blood report analyzer." }]
-      },
-      contents: [
+      model: OPENROUTER_MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
         {
           role: "user",
-          parts: [
-            { text: prompt },
+          content: [
+            { type: "text", text: userPrompt },
             {
-              inline_data: {
-                mime_type: mimeType || "image/jpeg",
-                data: imageBase64,
+              type: "image_url",
+              image_url: {
+                url: `data:${mimeType || "image/jpeg"};base64,${imageBase64}`,
               },
             },
           ],
         },
       ],
-      generationConfig: {
-        maxOutputTokens: 1000,
-        temperature: 0.1,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "OBJECT",
-          properties: {
-            summary: { type: "STRING" },
-            suggested_conditions: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  condition_name: { type: "STRING" },
-                  severity: { type: "STRING" }
-                },
-                required: ["condition_name", "severity"]
-              }
-            },
-            suggested_preferences: {
-              type: "ARRAY",
-              items: { type: "STRING" }
-            },
-            suggested_limits: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  nutrient: { type: "STRING" },
-                  max_daily_value: { type: "NUMBER" },
-                  unit: { type: "STRING" }
-                },
-                required: ["nutrient", "max_daily_value", "unit"]
-              }
-            },
-            abnormal_biomarkers: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  name: { type: "STRING" },
-                  value: { type: "STRING" },
-                  status: { type: "STRING" }
-                },
-                required: ["name", "value", "status"]
-              }
-            }
-          },
-          required: ["summary", "suggested_conditions", "suggested_preferences", "suggested_limits", "abnormal_biomarkers"]
-        }
-      },
+      max_tokens: 1000,
+      temperature: 0.1,
     };
 
-    const res = await fetch(`${GEMINI_URL}${apiKey}`, {
+    const res = await fetch(OPENROUTER_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://healthscan.app",
+        "X-Title": "HealthScan AI",
+      },
       body: JSON.stringify(payload),
     });
 
@@ -137,7 +92,7 @@ If the blood test is normal, suggest an empty array for conditions and limits, a
     }
 
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const text = data?.choices?.[0]?.message?.content;
 
     if (!text) {
       return NextResponse.json({ error: "AI returned empty text" }, { status: 500 });
@@ -151,7 +106,30 @@ If the blood test is normal, suggest an empty array for conditions and limits, a
       try {
         parsed = JSON.parse(cleaned);
       } catch (err) {
-        return NextResponse.json({ error: "Failed to parse JSON from AI" }, { status: 500 });
+        // Try extracting JSON object from response
+        const firstBrace = cleaned.indexOf("{");
+        if (firstBrace !== -1) {
+          let depth = 0;
+          let lastBrace = -1;
+          for (let i = firstBrace; i < cleaned.length; i++) {
+            if (cleaned[i] === "{") depth++;
+            else if (cleaned[i] === "}") {
+              depth--;
+              if (depth === 0) { lastBrace = i; break; }
+            }
+          }
+          if (lastBrace !== -1) {
+            try {
+              parsed = JSON.parse(cleaned.substring(firstBrace, lastBrace + 1));
+            } catch {
+              return NextResponse.json({ error: "Failed to parse JSON from AI" }, { status: 500 });
+            }
+          } else {
+            return NextResponse.json({ error: "Failed to parse JSON from AI" }, { status: 500 });
+          }
+        } else {
+          return NextResponse.json({ error: "Failed to parse JSON from AI" }, { status: 500 });
+        }
       }
     }
 

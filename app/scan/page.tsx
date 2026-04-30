@@ -335,7 +335,7 @@ export default function ScanPage() {
       }
 
       if (!res.ok) {
-        setOcrMessage(`Error: ${data.error || "Extraction failed"}`);
+        setOcrMessage("Error: Extraction failed");
         setExtractingOcr(false);
         return;
       }

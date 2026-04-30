@@ -1,13 +1,9 @@
 import { NextResponse } from "next/server";
 import { getAuthUser } from "@/lib/supabase/proxy";
 
-// Allow larger request bodies for image uploads (default is 1MB)
-export const config = {
-  api: { bodyParser: { sizeLimit: "4mb" } },
-};
 
-const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
+const OPENROUTER_MODEL = "google/gemini-2.0-flash-001"; // vision-capable model
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export async function POST(request: Request) {
   try {
@@ -32,7 +28,7 @@ export async function POST(request: Request) {
 
     console.log(`[Extract OCR] Image size: ${(imageBase64.length / 1024).toFixed(0)}KB base64`);
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       return NextResponse.json({ error: "API key missing" }, { status: 503 });
     }
@@ -49,53 +45,49 @@ Important rules:
 - If ingredients have sub-ingredients in parentheses, list the main ingredient and sub-ingredients separately
 - Nutrition values should be numbers only (no units)
 - Sodium should be in milligrams (mg)
-- If something is not readable or missing, use null`;
+- If something is not readable or missing, use null
+
+You MUST return ONLY a valid JSON object (no markdown, no explanation) exactly matching this schema:
+{
+  "parsed_name": string | null,
+  "parsed_ingredients": string[],
+  "parsed_nutrition": {
+    "calories": number | null,
+    "total_fat": number | null,
+    "sugars": number | null,
+    "sodium": number | null,
+    "protein": number | null
+  }
+}`;
 
     const payload = {
-      contents: [
+      model: OPENROUTER_MODEL,
+      messages: [
         {
-          parts: [
-            { text: prompt },
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
             {
-              inline_data: {
-                mime_type: mimeType || "image/jpeg",
-                data: imageBase64,
+              type: "image_url",
+              image_url: {
+                url: `data:${mimeType || "image/jpeg"};base64,${imageBase64}`,
               },
             },
           ],
         },
       ],
-      generationConfig: {
-        maxOutputTokens: 1200,
-        temperature: 0.1,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "OBJECT",
-          properties: {
-            parsed_name: { type: "STRING", nullable: true },
-            parsed_ingredients: {
-              type: "ARRAY",
-              items: { type: "STRING" },
-            },
-            parsed_nutrition: {
-              type: "OBJECT",
-              properties: {
-                calories: { type: "NUMBER", nullable: true },
-                total_fat: { type: "NUMBER", nullable: true },
-                sugars: { type: "NUMBER", nullable: true },
-                sodium: { type: "NUMBER", nullable: true },
-                protein: { type: "NUMBER", nullable: true },
-              },
-            },
-          },
-          required: ["parsed_name", "parsed_ingredients", "parsed_nutrition"],
-        },
-      },
+      max_tokens: 1200,
+      temperature: 0.1,
     };
 
-    const res = await fetch(`${GEMINI_URL}${apiKey}`, {
+    const res = await fetch(OPENROUTER_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://healthscan.app",
+        "X-Title": "HealthScan AI",
+      },
       body: JSON.stringify(payload),
     });
 
@@ -109,10 +101,10 @@ Important rules:
     }
 
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const text = data?.choices?.[0]?.message?.content;
 
     if (!text) {
-      console.error("[Extract OCR] No text in response. Candidate:", JSON.stringify(data?.candidates?.[0]));
+      console.error("[Extract OCR] No text in response:", JSON.stringify(data).substring(0, 300));
       return NextResponse.json({ error: "No text could be extracted from the image" }, { status: 500 });
     }
 

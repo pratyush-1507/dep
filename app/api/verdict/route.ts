@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/supabase/proxy";
 import { evaluateHealthRules, type ProductData, type UserProfile, type HealthRule } from "@/lib/health-rules";
 
-const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
+const OPENROUTER_MODEL = "google/gemini-2.0-flash-001";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 // POST /api/verdict — evaluate product for user
 // Accepts: { product_id } | { candidate_id } | { inline_product: ProductData & { name, barcode } }
@@ -139,7 +139,7 @@ export async function POST(request: Request) {
     }));
 
     // Evaluate with AI (fallback to deterministic if it fails)
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     let result = null;
 
     if (apiKey) {
@@ -174,7 +174,7 @@ export async function POST(request: Request) {
   }
 }
 
-// ── AI Verdict Evaluator ──────────────────────────────────────────────
+// ── AI Verdict Evaluator (OpenRouter) ────────────────────────────────
 
 async function evaluateWithAI(
   product: ProductData,
@@ -183,8 +183,7 @@ async function evaluateWithAI(
   apiKey: string
 ) {
   try {
-    const prompt = `
-You are HealthScan AI's verdict engine. Your job is to act as a highly strict medical and nutritional rule evaluator.
+    const prompt = `You are HealthScan AI's verdict engine. Your job is to act as a highly strict medical and nutritional rule evaluator.
 You will be provided with a Product's Nutritional Data, the User's Health Profile, and a list of System Health Rules.
 
 YOUR INSTRUCTIONS:
@@ -192,7 +191,7 @@ YOUR INSTRUCTIONS:
 2. Apply standard medical/dietary common sense AND strictly enforce any of the System Health Rules provided.
 3. Determine if the product is 'safe', 'caution' (minor flags, moderation required), or 'avoid' (contains allergens or heavily violates conditions).
 4. Provide a reasoning paragraph and list any triggered rules.
-5. You MUST return your answer as a valid JSON object matching exactly this schema, and nothing else (no markdown blocks like \`\`\`json):
+5. You MUST return your answer as a valid JSON object (no markdown, no code blocks) exactly matching this schema:
 {
   "verdict": "safe" | "caution" | "avoid",
   "confidence": number (0.0 to 1.0),
@@ -212,17 +211,22 @@ ${JSON.stringify(rules, null, 2)}
 `;
 
     const payload = {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        maxOutputTokens: 800,
-        temperature: 0.1, // very low temperature for deterministic evaluation
-        responseMimeType: "application/json",
-      },
+      model: OPENROUTER_MODEL,
+      messages: [
+        { role: "user", content: prompt },
+      ],
+      max_tokens: 800,
+      temperature: 0.1, // very low temperature for deterministic evaluation
     };
 
-    const res = await fetch(`${GEMINI_URL}${apiKey}`, {
+    const res = await fetch(OPENROUTER_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://healthscan.app",
+        "X-Title": "HealthScan AI",
+      },
       body: JSON.stringify(payload),
     });
 
@@ -232,7 +236,7 @@ ${JSON.stringify(rules, null, 2)}
     }
 
     const data = await res.json();
-    let text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    let text = data?.choices?.[0]?.message?.content;
 
     if (!text) return null;
 

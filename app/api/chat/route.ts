@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { getAuthUser } from "@/lib/supabase/proxy";
 
-const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=`;
+const OPENROUTER_MODEL = "google/gemini-2.0-flash-001";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
-// POST /api/chat — AI chatbot powered by Gemini (free tier), with rule-based fallback
+// POST /api/chat — AI chatbot powered by OpenRouter, with rule-based fallback
 export async function POST(request: Request) {
   // Auth check — use getAuthUser (not requireAuth) to avoid 307 redirects from API routes
   const { user, supabase } = await getAuthUser();
@@ -37,21 +37,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "messages array is required" }, { status: 400 });
     }
 
-    // Try Gemini first, fall back to deterministic if it fails
-    const apiKey = process.env.GEMINI_API_KEY;
-    const geminiReply = apiKey
-      ? await callGemini(messages, product_context, verdict_context, userProfileText, apiKey)
+    // Try OpenRouter first, fall back to deterministic if it fails
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    const aiReply = apiKey
+      ? await callOpenRouter(messages, product_context, verdict_context, userProfileText, apiKey)
       : null;
 
-    if (geminiReply) {
-      if (geminiReply === "__RATE_LIMIT__") {
+    if (aiReply) {
+      if (aiReply === "__RATE_LIMIT__") {
         return NextResponse.json({
-          reply: "⏳ The AI is currently experiencing high demand and is temporarily rate-limited by Google (15 requests/minute). Please wait a few seconds and try asking again.",
+          reply: "⏳ The AI is currently experiencing high demand. Please wait a few seconds and try again.",
           disclaimer: "System Message",
         });
       }
       return NextResponse.json({
-        reply: geminiReply,
+        reply: aiReply,
         disclaimer: "This is AI-generated informational content, not medical advice.",
       });
     }
@@ -71,9 +71,9 @@ export async function POST(request: Request) {
   }
 }
 
-// ── Gemini API (direct REST, no SDK needed) ──────────────────────────
+// ── OpenRouter API (OpenAI-compatible) ───────────────────────────────
 
-async function callGemini(
+async function callOpenRouter(
   messages: { role: string; content: string }[],
   product_context: Record<string, unknown> | null,
   verdict_context: Record<string, unknown> | null,
@@ -81,32 +81,38 @@ async function callGemini(
   apiKey: string
 ): Promise<string | null> {
   try {
-    const systemInstruction = buildSystemPrompt(product_context, verdict_context, userProfileText);
+    const systemPrompt = buildSystemPrompt(product_context, verdict_context, userProfileText);
 
-    // Build Gemini contents array: history + latest user message
-    const contents = messages.map((msg) => ({
-      role: msg.role === "assistant" ? "model" : "user",
-      parts: [{ text: msg.content }],
-    }));
+    // Build OpenAI-compatible messages array
+    const openaiMessages = [
+      { role: "system", content: systemPrompt },
+      ...messages.map((msg) => ({
+        role: msg.role === "assistant" ? "assistant" : "user",
+        content: msg.content,
+      })),
+    ];
 
     const payload = {
-      system_instruction: { parts: [{ text: systemInstruction }] },
-      contents,
-      generationConfig: {
-        maxOutputTokens: 600,
-        temperature: 0.5,
-      },
+      model: OPENROUTER_MODEL,
+      messages: openaiMessages,
+      max_tokens: 600,
+      temperature: 0.5,
     };
 
-    const res = await fetch(`${GEMINI_URL}${apiKey}`, {
+    const res = await fetch(OPENROUTER_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://healthscan.app",
+        "X-Title": "HealthScan AI",
+      },
       body: JSON.stringify(payload),
     });
 
     if (!res.ok) {
       const errBody = await res.text();
-      console.error(`[Gemini] HTTP ${res.status}: ${errBody.substring(0, 200)}`);
+      console.error(`[OpenRouter Chat] HTTP ${res.status}: ${errBody.substring(0, 200)}`);
       if (res.status === 429 || res.status === 503) {
         return "__RATE_LIMIT__";
       }
@@ -114,10 +120,10 @@ async function callGemini(
     }
 
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const text = data?.choices?.[0]?.message?.content;
     return text || null;
   } catch (err) {
-    console.error("[Gemini] Call failed:", err instanceof Error ? err.message : err);
+    console.error("[OpenRouter Chat] Call failed:", err instanceof Error ? err.message : err);
     return null; // fall back to deterministic
   }
 }
